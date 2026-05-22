@@ -2,7 +2,7 @@
 
 ## 1. Introduction
 
-This document explains how Roblox Studio blocks **`require`** when the thread that lacks the **LoadUnownedAsset** capability.
+This document explains how Roblox Studio blocks **`require`** when the thread lacks the **LoadUnownedAsset** capability.
 
 **Target:** `RobloxStudioBeta.exe`  
 **IDA image base:** `0x7FF667500000`  
