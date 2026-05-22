@@ -4,8 +4,6 @@ Studio error:
 
 > Script "Workspace..Script" was blocked from being ran under a restricted container.
 
-**Build analyzed:** recent `RobloxStudioBeta.exe` (Studio)
-
 ---
 
 ## 1. What is RobloxLocked
