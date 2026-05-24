@@ -150,7 +150,9 @@ Blocked.
 
 ### malicious hash?
 
-The build fingerprints the script source and compares it to a denylist on the ScriptContext. A hit is **BLOCK 2** with a malicious detection log, not the restricted container string.
+The build fingerprints the script source and compares it to a denylist on the ScriptContext. A hit is **BLOCK 2** with a malicious detection log, not the restricted container string. 
+
+The denylist is a list of 9000+ Roblox hashes that will kill the script if detected.
 
 ### BLOCK 2
 
@@ -174,8 +176,7 @@ If capabilities failed but this FFlag is off, Studio does not block startup for 
 
 ### BLOCK 3 restricted container
 
-Intersection failed and enforcement is on. Studio blocks startup and may log the restricted container message. This is the path people confuse with the RobloxLocked bool alone.
-
+Intersection failed and enforcement is on. Studio blocks startup and may log the restricted container message.
 **CoreScript** skips the malicious and capability branches in step 3 but still must pass the bucket compare.
 
 ## Example tree
