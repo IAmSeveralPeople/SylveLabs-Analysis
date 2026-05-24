@@ -4,347 +4,197 @@ Studio error:
 
 > Script "Workspace..Script" was blocked from being ran under a restricted container.
 
----
+**Target:** `RobloxStudioBeta.exe`  
+**Build:** `version-792bc2069be7464a`
 
-## 1. What is RobloxLocked
+## What is RobloxLocked
 
-**RobloxLocked** is a **bool property** on `Instance`. In the properties panel and reflection API it appears as `RobloxLocked`.
+**RobloxLocked** is a bool on `Instance`.
 
-**What it does:** When **RobloxLocked** is **true** on an instance, low-trust script identities cannot treat that instance (or its subtree) like normal game content. It cannot be referenced, destroyed, or created through normal GameScript APIs in the usual way.
+When set on an instance, **GameScript** cannot parent into it, destroy it, or hold a normal reference to it (or its subtree). **Plugin**, **Studio**, **CoreScript**, and higher contexts are not limited the same way.
 
-**Who is blocked:** **GameScript** identity (level 2) — normal `Script` and `LocalScript` in a place.
-
-**Who is not blocked:** **Plugin** (4), **Studio** (5), engine **CoreScript**, and other higher contexts.
-
-**What the bool does not do by itself:** Setting **RobloxLocked** to **true** does not print the restricted-container error. That message comes from a separate startup gate before Luau runs.
+The bool alone does **not** print the restricted container error. That message comes from the startup gate (`canScriptRun`) before Luau runs.
 
 ```mermaid
 flowchart LR
-    RL[RobloxLocked bool on Instance]
-    RL --> PROP[Property layer: GameScript blocked from parenting when true]
-    RL --> TAG[Subtree tagged for startup bucket walk]
-    TAG --> GATE[canScriptRun startup gate]
-    GATE --> ERR[restricted container error optional]
+    RL[RobloxLocked]
+    RL --> VIS[NotAccessible]
+    RL --> BUCKET[Container bucket walk]
+    BUCKET --> GATE[canScriptRun]
+    GATE --> ERR[restricted container error]
 ```
 
----
+**Overview diagram steps**
 
-## 2. Things you need to know
+**RobloxLocked** marks an instance and its subtree as protected in the data model. The flag is stored on the instance and read by both the visibility layer and the container walk.
 
-Read this before the flowchart. Three **different** systems are involved; mixing them up is the main source of confusion.
+**NotAccessible** is the capability class used when the engine refuses to push an `Instance` userdata into a low trust thread. GameScript hits this when reading properties or `ObjectValue` targets under a locked ancestor.
 
-The **RobloxLocked** bool uses **property descriptors** with high security (PluginSecurity-class read/write). That is **not** the same as the startup **capability** bitmasks below.
+**Container bucket walk** resolves which security territory owns the script versus the runner. RobloxLocked on a parent changes where the upward `.Parent` walk stops, so the script may land in a different bucket than the ScriptContext.
 
-### 2.1 Container bucket (startup — territory match)
+**canScriptRun** is the native gate that runs before the VM starts. It compares buckets, checks denylists, and optionally runs capability intersection.
 
-Before Luau runs, the engine asks: **does the script live in the same security territory as the runner?**
+**restricted container error** is the Studio log when enforcement decides the script cannot start in that territory. It is not emitted by the RobloxLocked property setter alone.
+
+## Why GameScript sees nil (cannot reference)
+
+This is separate from startup buckets and CLI179323.
+
+| Issue | Cause |
+|-------|--------|
+| `ObjectValue.Value` is nil | Engine did not push that `Instance` into the Luau thread |
+| `.Parent` on locked root fails | No userdata handle, not because the DM object was deleted |
+
+**NotAccessible** (capability bit **`0x20`**, index **5**) is the permission class tied to locked and protected instances. On this build the name decoder is around RVA **`0x2A57540`**. When push or wrap checks fail, Luau gets **nil** instead of userdata.
+
+**RobloxLocked** storage: **`Instance + 0x18A`** (byte). Native read around **`0x6C8541`**: `cmp byte ptr [rcx+0x18A], 0`.
+
+Do **not** trust the registered Luau getter stub at **`0x6C8530`** (`xor al, al; ret`). It always returns false to scripts. Use Studio properties or break **`0x6C8541`** with `RCX = Instance*`.
+
+Startup **capability intersection** (RVA ~**`0x2A58DC0`**, `lacking capability` string) only decides whether the script **starts**. It does not explain nil while a script is already running.
+
+```mermaid
+flowchart TD
+    A[GameScript reads Instance]
+    A --> B{security allows push?}
+    B -->|NotAccessible| C[nil in Luau]
+    B -->|Plugin / Studio| D[Instance userdata]
+```
+
+**Nil diagram steps**
+
+**GameScript reads Instance** covers any path that would expose an instance handle: properties, children, events, `ObjectValue.Value`, or `__index` on a reference.
+
+**security allows push** is the native check that maps thread identity plus instance flags (RobloxLocked, NotAccessible) to allow or deny creating userdata.
+
+**nil in Luau** means the call succeeded at the C API level but the script receives no reference, so parenting and most mutations are impossible on that object.
+
+**Instance userdata** is the normal path for Plugin or Studio identity, where the same DM pointer is wrapped and passed into the VM.
+
+## Startup gate
+
+Do not mix these pieces.
+
+### 1. Property layer
+
+RobloxLocked uses high property security (PluginSecurity class descriptors). That controls who may edit or parent in the properties sense. It is not the same as startup capability bitmasks.
+
+### 2. Container bucket
+
+Before Luau, the engine asks whether the script’s territory matches the runner’s.
 
 | Term | Meaning |
 |------|---------|
-| **scriptContainer** | Internal pointer after walking **up** `.Parent` from the **script** |
-| **contextContainer** | Internal pointer after resolving the **ScriptContext** runner |
-| **Bucket match** | `scriptContainer == contextContainer` (same address) |
+| **scriptContainer** | Walk **up** `.Parent` from the script to anchor |
+| **contextContainer** | Same walk from **ScriptContext** |
+| **Pass** | `scriptContainer == contextContainer` |
 
-When **RobloxLocked** is **true** on an ancestor, the script’s walk resolves a **restricted** container pointer. That does **not** automatically block startup; the script can still start if the runner’s container pointer matches.
+RobloxLocked on an ancestor changes which container the script resolves to. Mismatch is **BLOCK 1** (silent). A match does not guarantee the script runs.
 
-### 2.2 Startup capabilities (startup — bitmask on ScriptContext)
-
-Controlled by Studio **FFlags**. When **CLI179323** is **on**, the engine checks whether the **ScriptContext** already holds the capability bits required for this script’s **RunContext**.
+### 3. Startup capabilities (FFlags)
 
 | FFlag | Role |
 |-------|------|
-| **CLI179323** | Master switch: run the capability gate at script start |
-| **CLI179323Enforce** | If **capability intersection** fails, only when this is **on** does Studio block startup and show the restricted-container error |
+| **CLI179323** | Run capability check at start |
+| **CLI179323Enforce** | If intersection fails, show restricted container error |
 
-### 2.3 Required masks (RunContext on the script)
+**RunContext → required mask** (examples):
 
-The startup gate reads **RunContext** on the script instance and maps it to a **required capability mask**.
+| RunContext | Required mask |
+|------------|---------------|
+| Legacy (0) | `0x0` |
+| Plugin (3) | `0x300000000000000B` |
+| Server / Client | see RE notes |
 
-| RunContext | Level | Required mask | Typical script |
-|------------|-------|---------------|----------------|
-| **Legacy** | **0** | **`0x0`** | Workspace `Script` under an instance with **RobloxLocked** **true** |
-| Server | 1 | `0x2000000000000003` | ServerScript |
-| Client | 2 | `0x0` | LocalScript |
-| **Plugin** | **3** | **`0x300000000000000B`** | PluginScript |
-| 5 | 5 | `0x2000000000000001` | — |
-| 6 | 6 | `0x700000000000000B` | — |
-| 7, 8 | 7–8 | `0x200000000000003F` | — |
-| 9, 0xD | 9, 13 | `0xC` | — |
-| 10 | 10 | `0x6000000000000003` | — |
-| 11 | 11 | `0x2000000000000000` | — |
-| 12 | 12 | `0x1000000000000000` | — |
-
-### 2.4 Stored masks (what must match required)
-
-**Capability intersection** compares the required mask to masks stored on the **ScriptContext**:
-
-| Location | Field |
-|----------|--------|
-| Script context inner object **`+0x208` (520)** | Wide capability mask (QWORD) |
-| Script context object **`+0x198`** | Narrow capability mask (BYTE) |
-
-**Pass rule:**
+**Stored on ScriptContext:** wide **`+0x208`**, byte **`+0x198`**.
 
 ```
-wideOK  = (storedWide == 0) OR ((required & storedWide) == storedWide)
-byteOK  = (storedByte == 0) OR ((required & storedByte) == storedByte)
-PASS    = wideOK AND byteOK
+wideOK = (storedWide == 0) OR ((required & storedWide) == storedWide)
+byteOK = (storedByte == 0) OR ((required & storedByte) == storedByte)
+PASS   = wideOK AND byteOK
 ```
 
-For **Legacy** (`required = 0`), the stored masks must still satisfy these rules. If intersection **fails**, you get **BLOCK 3** even when the bucket matched.
+Legacy with required `0x0` can still fail intersection if stored masks are wrong. That leads to **BLOCK 3** when enforce is on.
 
----
-
-## 3. Full flowchart
-
-Read top to bottom. **Property layer** (left) is separate from **startup gate** (right).  
-If **canScriptRun** passes, Luau starts; otherwise the script is blocked.
+## Flowchart
 
 ```mermaid
 flowchart TD
-    subgraph prop ["Layer 1 - RobloxLocked bool property"]
-        RL[RobloxLocked bool true on Instance]
-        RL --> ID2[GameScript 2 cannot parent when bool true]
-        RL --> ID45[Plugin 4 and Studio 5 can edit]
-    end
-
-    subgraph run ["Layer 2 - startup gate"]
-        GO([User clicks Run]) --> SS[startScript]
-        SS --> CSR[canScriptRun]
-        CSR --> S1Q{Step 1 same bucket?}
-        S1Q -->|no| BL1[BLOCK 1 silent]
-        S1Q -->|yes| S2Q{Step 2 CoreScript class?}
-        S2Q -->|yes| S3Q
-        S2Q -->|no| S2H{On malicious list?}
-        S2H -->|yes| BL2[BLOCK 2 malicious log]
-        S2H -->|no| S3Q
-        S3Q{Step 3 capability check enabled?}
-        S3Q -->|CLI179323 off| SKIP[Skip capability intersection]
-        S3Q -->|CLI179323 on| S3C{"User Script?"}
-        S3C -->|CoreScript| ENG[Engine script - caps N/A]
-        S3C -->|yes| S3I{Capability intersection pass?}
-        S3I -->|yes| PCOK[Required capabilities present]
-        S3I -->|no| S3E{CLI179323Enforce on?}
-        S3E -->|yes| BL3[BLOCK 3a missing capabilities]
-        S3E -->|no| PCFAIL[Capabilities missing - enforce off]
-        ENG --> LU[Luau runs]
-        SKIP --> LU
-        PCOK --> LU
-        PCFAIL --> LU
-    end
+    GO([Run]) --> CSR[canScriptRun]
+    CSR --> S1{same bucket?}
+    S1 -->|no| BL1[BLOCK 1 silent]
+    S1 -->|yes| S2{malicious hash?}
+    S2 -->|yes| BL2[BLOCK 2]
+    S2 -->|no| S3{CLI179323 on?}
+    S3 -->|no| LU[Luau]
+    S3 -->|yes| S3I{capabilities OK?}
+    S3I -->|yes| LU
+    S3I -->|no| S3E{CLI179323Enforce?}
+    S3E -->|yes| BL3[BLOCK 3 restricted container]
+    S3E -->|no| LU
 ```
 
-### What each box means
+### Run
 
-| Box | Explanation |
-|-----|-------------|
-| **Layer 1** | **RobloxLocked** bool property: who may **parent** or **edit** instances where the bool is **true** (`printidentity`). Does **not** call **canScriptRun**. |
-| **Layer 2** | **canScriptRun**: may this script **start**? |
-| **Step 1** | Container bucket. **RobloxLocked** **true** on a parent changes `scriptContainer`. Edit-mode Run often fails here (silent). |
-| **Step 2** | Malicious hash denylist. Different log text than restricted-container. |
-| **Step 3** | **Startup capabilities.** **RunContext** → **required mask** (2.3), compared to **stored masks** (2.4) via **capability intersection**. |
-| **Skip capability intersection** | **CLI179323** off — capabilities are not checked at start (bucket + not malicious still required). |
-| **Required capabilities present** | Intersection **pass** — **ScriptContext** has the bits needed for this **RunContext**. |
-| **Capabilities missing - enforce off** | Intersection **failed**, **CLI179323Enforce** off — no restricted-container error and no capability block at startup. **BLOCK 1** may still apply. Not the same as having correct capabilities. |
-| **BLOCK 3a missing capabilities** | Intersection **failed**, **CLI179323Enforce** on — blocked with the restricted-container error. |
-| **Engine script** | **CoreScript**: malicious and capability checks are skipped in step 3. |
-| **Your Workspace Script** | Under an instance with **RobloxLocked** **true**: GameScript 2, Legacy **RunContext**, required mask `0x0`. Needs bucket match plus capabilities OK (or **CLI179323** off). |
+The user triggers execution from Studio (Run, Play, or an equivalent start path). The scheduler eventually reaches **`startScript`**, which always consults **`canScriptRun`** before any bytecode runs.
 
----
+### canScriptRun
 
-## 4. Explanation of everything
+This function collects the script instance, its **RunContext**, and the owning **ScriptContext**. All later checks use those inputs; nothing in Luau has started yet.
 
-### 4.0 Schedule — `startScript`
+### same bucket?
 
-Engine entry: **`startScript`** calls **`canScriptRun`** before the Luau VM starts.
+The engine walks parents from the script and from the ScriptContext runner until each side has a container pointer. If **`scriptContainer != contextContainer`**, the script is in a different territory than the runner and startup stops with **BLOCK 1** (usually silent).
 
-Nothing is blocked yet. Inputs: script pointer, **RunContext**, and which **ScriptContext** owns the run.
+### BLOCK 1 silent
 
----
+Edit mode Run often fails here because the ScriptContext used for testing does not match the Workspace side container that RobloxLocked parents introduce. Play mode can still fail if the resolved buckets differ for other reasons.
 
-### 4.1 ALLOW A — CoreScript
+### malicious hash?
 
-| Requirement | |
-|-------------|--|
-| Instance class is **CoreScript** (engine script, not a user `Script`) | |
-| **Bucket compare still runs** | Must match like any other script |
-| Malicious / capability gates | Skipped inside steps 2–3, then **Luau runs** |
+The build fingerprints the script source and compares it to a denylist on the ScriptContext. A hit is **BLOCK 2** with a malicious detection log, not the restricted container string.
 
-Internal engine code does not use the user-script denylist or capability failure paths. Your Workspace `Script` is **not** CoreScript—you need **ALLOW B** or **C**.
+### BLOCK 2
 
----
+This path is unrelated to RobloxLocked visibility. It is a separate anti abuse gate on known bad script hashes.
 
-### 4.2 BLOCK 1 — Wrong bucket
+### CLI179323 on?
 
-**Chart diamond:** `scriptContainer != contextContainer`
+When this FFlag is off, capability intersection is skipped entirely. The script may proceed if bucket and malicious checks already passed.
 
-#### Walk up `.Parent` (how territory is chosen)
+### capabilities OK?
 
-Example tree (**RobloxLocked** bool **true** on the folder):
+When CLI179323 is on, **RunContext** selects a required capability mask. That mask is compared to the wide and byte masks stored on the ScriptContext. Both wide and byte rules must pass for intersection to succeed.
+
+### Luau
+
+The VM initializes and the script body runs. Reaching this node means startup gates accepted the script for this context.
+
+### CLI179323Enforce?
+
+If capabilities failed but this FFlag is off, Studio does not block startup for missing caps. The script can still be stopped earlier by **BLOCK 1** or **BLOCK 2**.
+
+### BLOCK 3 restricted container
+
+Intersection failed and enforcement is on. Studio blocks startup and may log the restricted container message. This is the path people confuse with the RobloxLocked bool alone.
+
+**CoreScript** skips the malicious and capability branches in step 3 but still must pass the bucket compare.
+
+## Example tree
 
 ```
-DataModel
-└── Workspace
-    └── Folder (RobloxLocked = true)
-        └── Script   ← Run
+Workspace
+└── Folder (RobloxLocked)
+    └── Script
 ```
 
-**Script side:**
+Script walk: Script → locked Folder → Workspace (ServiceProvider) = **scriptContainer**.
 
-1. `Script` → parent with **RobloxLocked** **true**
-2. That parent → `Workspace`
-3. `Workspace` is a **ServiceProvider** → stop; store **scriptContainer**
+Runner walk from **ScriptContext** must land the same pointer.
 
-**Runner side:** the same walk from **ScriptContext** → **contextContainer**.
+## References
 
-```mermaid
-flowchart TB
-    S[Script] --> P1[Parent RobloxLocked true]
-    P1 --> P2[Parent Workspace]
-    P2 --> SC[scriptContainer]
-    CTX[ScriptContext] --> CC[contextContainer]
-    SC --> EQ{equal?}
-    CC --> EQ
-    EQ -->|No| B1[BLOCK 1 silent]
-    EQ -->|Yes| next[continue]
-```
-
----
-
-### 4.3 BLOCK 2 — Malicious hash
-
-**Chart diamond:** fingerprint on denylist
-
-- **Check:** 32-character hex fingerprint vs denylist on **ScriptContext**
-- **Log:** `detected as malicious` — not the restricted-container message
-- **Explaination:** 9000+ Hashes that are detected then blocked from running
-
-**Typical trace:** buckets matched; denylist **not** hit.
-
-```mermaid
-flowchart LR
-    FP[Build fingerprint] --> LOOKUP[Denylist lookup]
-    LOOKUP -->|hit| B2[BLOCK 2]
-    LOOKUP -->|miss| NEXT[Step 3 capabilities]
-```
-
----
-
-### 4.4 ALLOW B — FFlag CLI179323 off
-
-**Chart diamond:** **CLI179323** **off** → skip capability gate
-
-| Must already pass | |
-|-------------------|--|
-| Not **CoreScript** | |
-| Buckets **match** | |
-| Not on malicious denylist | |
-| **CLI179323** **off** | |
-
-Capabilities are **not** checked. The script can start if the bucket matches.
-
----
-
-### 4.5 ALLOW C — FFlag CLI179323 on + capabilities OK
-
-**Chart diamond:** capability intersection **PASS**
-
-| Must already pass | |
-|-------------------|--|
-| Buckets **match** | |
-| Not on malicious denylist | |
-| **CLI179323** **on** | |
-| **Capability intersection** **PASS** | |
-
-#### What “capabilities OK” means
-
-```mermaid
-flowchart LR
-    RC[RunContext Legacy 0] --> REQ[required mask 0x0]
-    REQ --> IX[Capability intersection]
-    ST1[stored wide mask] --> IX
-    ST2[stored byte mask] --> IX
-    IX -->|pass| C[ALLOW C]
-    IX -->|fail| B3[BLOCK 3 path]
-```
-
-| RunContext | Required mask | Meaning |
-|------------|---------------|---------|
-| **Legacy (0)** | `0x0` | Pass intersection rules for zero required bits |
-| **Plugin (3)** | `0x300000000000000B` | Stored masks must cover plugin bits |
-| Server / Client | See table 2.3 | Stricter than Legacy |
-
-For a user `Script` with **RobloxLocked** **true** and **Legacy** **RunContext**, the realistic path when enforcement is on: **bucket match + capability intersection pass**.
-
----
-
-### 4.6 BLOCK 3 / 3a — Missing startup capabilities
-
-**Chart diamond:** **CLI179323** **on** and intersection **FAIL**
-
-| Variant | CLI179323Enforce | Result |
-|---------|------------------|--------|
-| **3a** | **on** + capabilities **missing** | Blocked + restricted-container error |
-| **Capabilities missing, enforce off** | **off** + capabilities **missing** | Not blocked for capabilities; no restricted-container log |
-
-If the script still does not run with enforce off, check **BLOCK 1** (edit vs play **ScriptContext**), not BLOCK 3a.
-
-#### Live trace (script under **RobloxLocked** **true**)
-
-| Field | Result |
-|-------|--------|
-| **RobloxLocked** bool | **true** on ancestor |
-| Luau identity | **GameScript 2** (property layer) |
-| RunContext | **Legacy 0** → required mask **`0x0`** |
-| Buckets | **Matched** |
-| Malicious denylist | **Not hit** |
-| CLI179323 | **On** |
-| Capability intersection | **Failed** |
-| CLI179323Enforce | **Off** → no restricted-container log from capabilities; if the script still never runs, suspect **BLOCK 1** |
-
----
-
-### 4.7 Plugin scripts (ALLOW B or C)
-
-Not a separate chart branch. **Plugin** **RunContext (3)** still requires:
-
-1. **Bucket match**
-2. **Not** on malicious denylist
-3. **ALLOW B** (**CLI179323** off) **or** **ALLOW C** (**on** + plugin mask `0x300000000000000B` satisfied)
-
----
-
-### 4.8 Checklist — user `Script` under **RobloxLocked** **true**
-
-| # | Requirement | Layer |
-|---|-------------|-------|
-| 1 | Not **CoreScript** | Startup |
-| 2 | `scriptContainer == contextContainer` | Bucket |
-| 3 | Not on malicious denylist | Startup |
-| 4a | **Or** **CLI179323** off | ALLOW B |
-| 4b | **Or** **CLI179323** on + capability intersection **PASS** | ALLOW C |
-| — | **GameScript 2** cannot parent into instances where **RobloxLocked** is **true** | Bool property |
-| — | **Plugin 4 / Studio 5** can edit those instances | Bool property |
-
-```mermaid
-flowchart TD
-    S[Script under RobloxLocked true]
-    S --> Q1{Same bucket?}
-    Q1 -->|No| F1[BLOCK 1]
-    Q1 -->|Yes| Q2{Malicious?}
-    Q2 -->|Yes| F2[BLOCK 2]
-    Q2 -->|No| Q3{CLI179323 on?}
-    Q3 -->|No| OKB[ALLOW B]
-    Q3 -->|Yes| Q4{Capabilities OK?}
-    Q4 -->|Yes| OKC[ALLOW C]
-    Q4 -->|No| F3[BLOCK 3]
-```
-
----
-
-## 5. References
-
-- [Pseudoreality/Roblox-Identities](https://github.com/Pseudoreality/Roblox-Identities/) — Luau identity levels (GameScript 2, Plugin 4, Studio 5)
+- [Pseudoreality/Roblox-Identities](https://github.com/Pseudoreality/Roblox-Identities/) identity levels
 
 ---
 
