@@ -71,9 +71,7 @@ flowchart TD
 
 **Instance userdata** is the normal path for Plugin or Studio identity, where the same DM pointer is wrapped and passed into the VM.
 
-## Startup gate
-
-Do not mix these pieces.
+## How does roblox block scripts inside RobloxLocked?
 
 ### 1. Property layer
 
