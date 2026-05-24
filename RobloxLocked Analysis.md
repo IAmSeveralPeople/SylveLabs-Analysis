@@ -148,7 +148,7 @@ The engine walks parents from the script and from the ScriptContext runner until
 
 ### BLOCK 1 silent
 
-Edit mode Run often fails here because the ScriptContext used for testing does not match the Workspace side container that RobloxLocked parents introduce. Play mode can still fail if the resolved buckets differ for other reasons.
+Blocked.
 
 ### malicious hash?
 
@@ -172,7 +172,7 @@ The VM initializes and the script body runs. Reaching this node means startup ga
 
 ### CLI179323Enforce?
 
-If capabilities failed but this FFlag is off, Studio does not block startup for missing caps. The script can still be stopped earlier by **BLOCK 1** or **BLOCK 2**.
+If capabilities failed but this FFlag is off, Studio does not block startup for missing capabilities. The script can still be stopped earlier by **BLOCK 1** or **BLOCK 2**.
 
 ### BLOCK 3 restricted container
 
